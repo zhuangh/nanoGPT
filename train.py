@@ -204,7 +204,8 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model, backend="cudagraphs") # requires PyTorch 2.0
+    # model = torch.compile(model, backend="cudagraphs") # requires PyTorch 2.0
+    model = torch.compile(model, backend="cudagraphs")#, mode="reduce-overhead") # requires PyTorch 2.0
     #['cudagraphs', 'inductor', 'onnxrt', 'openxla', 'openxla_eval', 'tvm']
 
 # wrap model into DDP container
@@ -247,7 +248,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     print(f"wandb_project name {wandb_project}, run_name {wandb_run_name}")
 
-g = torch.cuda.CUDAGraph()
+# g = torch.cuda.CUDAGraph()
 start = time.perf_counter()
 with profile(activities=[torch.profiler.ProfilerActivity.CPU, 
                          torch.profiler.ProfilerActivity.CUDA], 

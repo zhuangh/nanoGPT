@@ -14,6 +14,37 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+# GELU kernel
+@triton.jit
+def gelu_kernel(x_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    # Define the program ID
+    pid = tl.program_id(0)
+
+    # Compute the start and end indices for this program
+    # start_idx = pid * BLOCK_SIZE
+    # end_idx = start_idx + BLOCK_SIZE
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < BLOCK_SIZE
+    x = tl.load(x_ptr + offsets, mask=mask)
+    output = 2 * x * 0.5
+    #output = 0.5 * x * (1 + tl.math.tanh(tl.math.sqrt(3.1415926 / 2) * (x + 0.044715 * tl.math.pow(x,3.0))))
+    tl.store(output_ptr+offsets, output, mask=mask)
+
+    # # Iterate over the elements assigned to this program
+    # for i in range(start_idx, end_idx):
+    #     if i < BLOCK_SIZE:
+    #         x = X[i, :]
+    #         # GELU function
+    #         y = 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * torch.pow(x, 3))))
+    #         Y[i, :] = y
+    # return Y
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -48,6 +79,12 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        else:
+            print("not flash attention")
+
+        self.triton_sm = False 
+        if self.triton_sm:
+            print("triton softmax is enable.")
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -65,8 +102,16 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            attx = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if not self.triton_sm:
+                att = F.softmax(attx, dim=-1)
+            else:
+                att = torch.empty_like(attx)
+                grid = (attx.shape[0], )
+                softmax[grid](att, att.stride(0), att.stride(1), 
+                    attx, attx.stride(0), attx.stride(1),
+                    attx.shape[0]    , attx.shape[1], BLOCK_SIZE=1024)
+            
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -80,13 +125,27 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        # else:
+        #     self.c_fc    = tl.matmul
+        #     self.c_fc    = tl.matmul #nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        #     self.c_proj  = tl.matmul #nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        
+        self.gelu    = nn.GELU()
+        #self.gelu    = gelu_kernel()
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
+        #print(x.shape)
+        y = torch.zeros_like(x)
+        grid = (x.shape[0], )
+        gelu_kernel[grid](x, y, x.shape[1] * x.shape[2])
+        # print(y)
+        x = y
+
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -115,6 +174,55 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+# rotary positional embedding
+# https://arxiv.org/abs/2104.09864
+# 
+# 
+# class RotaryEmbedding(nn.Module):
+    # def __init__(self, dim):
+        # super().__init__()
+        # inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        # self.register_buffer("inv_freq", inv_freq)
+# 
+    # def forward(self, max_seq_len, *, device):
+        # seq = torch.arange(max_seq_len, device=device, dtype=self.inv_freq.dtype)
+        # freqs = einsum("i , j -> i j", seq, self.inv_freq)
+        # return torch.cat((freqs, freqs), dim=-1)
+# 
+# 
+# def rotate_half(x):
+    # x = rearrange(x, "... (j d) -> ... j d", j=2)
+    # x1, x2 = x.unbind(dim=-2)
+    # return torch.cat((-x2, x1), dim=-1)
+# 
+# 
+# def apply_rotary_pos_emb(pos, t):
+    # return (t * pos.cos()) + (rotate_half(t) * pos.sin())
+# 
+        
+# @triton.jit
+# def softmax(Y, stride_ym, stride_yn, X, stride_xm, stride_xn, M, N, BLOCK_SIZE: tl.constexpr):
+#     # row index
+#     m = tl.program_id(0)
+#     # col indices
+#     # this specific kernel only works for matrices that 
+#     # have less than BLOCK_SIZE columns
+#     n = tl.arange(0, BLOCK_SIZE)
+#     # the memory address of all the elements
+#     # that we want to load can be computed as follows
+#     X = X + m * stride_xm + n * stride_xn
+#     # load input data; pad out-of-bounds elements with 0 
+#     x = tl.load(X, mask=n < N, other=-float('inf'))
+#     # compute numerically-stable softmax
+#     z = x - tl.max(x, axis=0)
+#     num = tl.exp(z)
+#     denom = tl.sum(num, axis=0)
+#     y = num / denom
+#     # write back to Y
+#     Y = Y + m * stride_ym + n * stride_yn
+#     tl.store(Y, y, mask=n < N)
+
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -126,6 +234,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = RotaryEmbedding(config.n_embd, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -321,7 +430,7 @@ class GPT(nn.Module):
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)           
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
